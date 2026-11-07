@@ -1,0 +1,12 @@
+[Unit]
+Description=Telegram reminder bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/root/olga-bot
+ExecStart=/root/olga-bot/venv/bin/python /root/olga-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

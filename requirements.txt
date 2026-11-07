@@ -1,0 +1,4 @@
+aiogram>=3.31,<4
+anthropic>=0.70
+python-dotenv>=1.0
+faster-whisper>=1.2
