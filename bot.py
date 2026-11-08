@@ -55,6 +55,9 @@ CHECK_EVERY_MIN = int(os.getenv("CHECK_EVERY_MIN", "60"))  # как часто �
 FIRST_REMIND_AFTER_H = float(os.getenv("FIRST_REMIND_AFTER_H", "3"))  # первое напоминание через N часов после вопроса
 REMIND_EVERY_H = float(os.getenv("REMIND_EVERY_H", "6"))  # повтор не чаще чем раз в N часов
 MAX_REMINDERS = int(os.getenv("MAX_REMINDERS", "3"))      # после стольких напоминаний — сообщить владелице
+# выходные дни, когда напоминания не отправляются (по московскому времени)
+_DAYS = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
+DAYS_OFF = {_DAYS[d] for d in re.findall(r"[а-я]{2}", os.getenv("DAYS_OFF", "ср,вс").lower()) if d in _DAYS}
 QUIET_MIN = int(os.getenv("QUIET_AFTER_ACTIVITY_MIN", "30"))  # не влезать, если в чате переписываются прямо сейчас
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))      # сколько дней переписки анализировать
 PREFIX = os.getenv("REMINDER_PREFIX", "🤖 Напоминание")
@@ -171,6 +174,17 @@ def store_msg(chat_id, msg_id, who, name, text, ts, media=None, file_id=None, pe
     db.commit()
 
 
+# ─────────── ЗАПРОС К CLAUDE ───────────
+async def ask_claude(max_tokens: int = 8000, **kw) -> str:
+    """Возвращает текст ответа. Если текста нет — ошибка с причиной (а не тихий пустой ответ)."""
+    resp = await claude.messages.create(model=MODEL, max_tokens=max_tokens, **kw)
+    text = "".join(getattr(b, "text", "") or "" for b in resp.content if b.type == "text").strip()
+    if not text:
+        raise RuntimeError(f"Claude вернул пустой ответ (stop_reason={resp.stop_reason}, "
+                           f"блоки={[b.type for b in resp.content]})")
+    return text
+
+
 # ─────────── РАСШИФРОВКА ГОЛОСОВЫХ И ОПИСАНИЕ ФОТО ───────────
 _whisper = None
 _media_lock = asyncio.Lock()
@@ -197,14 +211,13 @@ async def transcribe(bot: Bot, file_id: str) -> str | None:
 async def describe_photo(bot: Bot, file_id: str, caption: str) -> str:
     buf = await bot.download(file_id, timeout=120)
     b64 = base64.b64encode(buf.read()).decode()
-    resp = await claude.messages.create(
-        model=MODEL, max_tokens=300,
+    return await ask_claude(
+        max_tokens=2000,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": "Это фото из рабочего чата пиццерии" +
              (f" с подписью «{caption}»" if caption else "") +
              ". Опиши в 1–2 предложениях, что на нём, и перепиши ключевые цифры и текст, если есть. Только описание."}]}])
-    return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
 async def process_media(bot: Bot, chat_id: int, msg_id: int, media: str, file_id: str, caption: str):
@@ -289,12 +302,18 @@ SYSTEM = """Ты помощник владелицы бизнеса. Тебе д
 
 Пункт ЗАКРЫТ, если:
 - собеседник ответил по существу (информация, цифры, фото, решение);
-- на поручение собеседник ответил подтверждением («сделала», «готово», «ок, сделаю», «принято»), кроме случаев, когда владелица явно просила прислать результат или отчёт, а его ещё нет;
+- на поручение с конкретным действием собеседник подтвердил ВЫПОЛНЕНИЕ («сделала», «готово», «отправила», прислал фото или отчёт);
+- это правило или инструкция на будущее («если будет X — делай Y», «так больше не делаем») и собеседник подтвердил, что понял («хорошо», «поняла», «ок»);
 - ответ дан голосовым, кружком или фото и по расшифровке/описанию понятно, что это ответ на вопрос;
 - владелица сама сняла вопрос («уже не надо», «разобралась») или ответ очевиден из дальнейшей переписки.
 
 Голосовые и кружки даны расшифровкой, фото — описанием: используй их как обычные ответы. Если голосовое помечено «без расшифровки» (старая история) — считай его ответом на предыдущий вопрос.
 Статус «unclear» ставь, когда после вопроса пришло голосовое, кружок или фото, но непонятно, отвечает ли оно на этот вопрос (расшифровка не удалась или по смыслу неясно).
+
+ВАЖНО: «хорошо», «ок», «да», «поняла», «сделаю», «посмотрю», «уточню», смайлик или реакция НЕ закрывают:
+- вопрос, на который нужна информация, цифра, дата, имя или решение — нужен сам ответ по существу;
+- поручение с конкретным действием — нужно подтверждение выполнения, а не обещание.
+Обещание «сделаю / посмотрю / уточню» без последующего результата — пункт ОТКРЫТ.
 
 Не считай вопросами: приветствия, «как дела», благодарности, риторические вопросы, реплики без ожидания ответа. Если в одном сообщении несколько отдельных вопросов, а ответили только на часть — каждый неотвеченный отдельным пунктом. Свежие вопросы (последние минуты переписки) тоже включай: время напоминания решает программа.
 
@@ -336,11 +355,14 @@ async def analyze_chat(chat_id: int, delay_first: bool = False, bot: Bot | None 
             + ("\n".join(f"- {i['question']} (сообщение #{i['asked_msg_id']})" for i in done) or "нет") + "\n\n"
             f"Переписка (формат: [#номер дата время] Имя: текст):\n" + "\n".join(lines))
 
-    resp = await claude.messages.create(
-        model=MODEL, max_tokens=2000,
-        system=SYSTEM.format(owner=owner, other=other),
-        messages=[{"role": "user", "content": user}])
-    data = parse_json("".join(b.text for b in resp.content if b.type == "text"))
+    raw = await ask_claude(system=SYSTEM.format(owner=owner, other=other),
+                           messages=[{"role": "user", "content": user}])
+    try:
+        data = parse_json(raw)
+    except Exception:
+        data = None
+    if not isinstance(data, dict) or ("existing" not in data and "new" not in data):
+        raise RuntimeError("Не удалось разобрать ответ Claude: " + raw[:300])
 
     other_ids = {m["msg_id"] for m in msgs if m["who"] == "other"}
 
@@ -503,6 +525,8 @@ async def tick(bot: Bot):
     h = datetime.now(TZ).hour
     if not (WORK_START <= h < WORK_END):
         return
+    if datetime.now(TZ).weekday() in DAYS_OFF:
+        return  # выходной — не проверяем и не напоминаем
     for chat in q("SELECT * FROM chats"):
         newest = q1("SELECT MAX(ts) t FROM msgs WHERE chat_id=? AND who!='bot'", chat["chat_id"])["t"] or 0
         pending = q1("SELECT 1 FROM msgs WHERE chat_id=? AND pending=1 AND ts>?", chat["chat_id"], now() - 600)
@@ -531,6 +555,8 @@ def status_text() -> str:
     rows = q("""SELECT i.*, c.title FROM items i JOIN chats c ON c.chat_id=i.chat_id
                 WHERE i.status='open' ORDER BY i.asked_ts""")
     head = "⏸ Напоминания на паузе.\n\n" if is_paused() else ""
+    if datetime.now(TZ).weekday() in DAYS_OFF:
+        head += "🌙 Сегодня выходной — напоминаний не будет.\n\n"
     rev = q("""SELECT i.*, c.title FROM items i JOIN chats c ON c.chat_id=i.chat_id
                WHERE i.status='review' ORDER BY i.asked_ts""")
     if rev:
