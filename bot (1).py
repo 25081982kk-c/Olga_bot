@@ -65,6 +65,10 @@ SHEET_URL = os.getenv("SHEET_WEBHOOK_URL", "").strip()
 SHEET_SECRET = os.getenv("SHEET_SECRET", "").strip()
 MOVE_AFTER = int(os.getenv("MOVE_AFTER_REMINDERS", "2"))
 WEEKDAY_SHEETS = {0: "🧭 Упр Пн", 1: "🧭 Упр Вт", 3: "🧭 Упр Чт", 4: "🧭 Упр Пт", 5: "🧭 Упр Сб"}
+# фокусы на день: анализ владелице вечером, отправка управляющей утром (часы по Москве)
+FOCUS_ENABLED = os.getenv("FOCUS_ENABLED", "1") == "1"
+FOCUS_PREP_HOUR = int(os.getenv("FOCUS_PREP_HOUR", "22"))
+FOCUS_SEND_HOUR = int(os.getenv("FOCUS_SEND_HOUR", "10"))
 QUIET_MIN = int(os.getenv("QUIET_AFTER_ACTIVITY_MIN", "30"))  # не влезать, если в чате переписываются прямо сейчас
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))      # сколько дней переписки анализировать
 PREFIX = os.getenv("REMINDER_PREFIX", "🤖 Напоминание")
@@ -126,6 +130,20 @@ def now() -> int:
 
 def fmt_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%d.%m %H:%M")
+
+
+def kv_get(k, default=None):
+    r = q1("SELECT v FROM kv WHERE k=?", k)
+    if not r:
+        return default
+    try:
+        return json.loads(r["v"])
+    except Exception:
+        return r["v"]
+
+
+def kv_set(k, v):
+    ex("INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)", k, json.dumps(v, ensure_ascii=False))
 
 
 def is_paused() -> bool:
@@ -535,6 +553,21 @@ async def sheet_call(payload: dict) -> bool:
         return False
 
 
+async def sheet_json(payload: dict):
+    """Запрос к таблице с ответом (для чтения планировщика)."""
+    if not SHEET_URL:
+        return None
+    payload = dict(payload, secret=SHEET_SECRET)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90)) as s:
+            async with s.post(SHEET_URL, json=payload, allow_redirects=True) as r:
+                data = json.loads(await r.text())
+        return data if data.get("ok") else None
+    except Exception as e:
+        log.warning("Не удалось прочитать таблицу: %s", e)
+        return None
+
+
 def work_day_sheet():
     """Сегодняшняя (или ближайшая рабочая) вкладка и дата."""
     from datetime import timedelta
@@ -550,7 +583,7 @@ async def move_to_sheet(bot: Bot, chat, items) -> None:
     sheet, date = work_day_sheet()
     moved = []
     for i in items:
-        sid = str(uuid.uuid4())
+        sid = "tg:" + str(uuid.uuid4())
         text = f"{i['question']} (вопрос из Telegram от {fmt_ts(i['asked_ts'])[:5]}, без ответа)"
         if await sheet_call({"action": "add", "id": sid, "date": date, "text": text, "sheet": sheet}):
             ex("UPDATE items SET status='moved', sheet_id=?, closed_ts=? WHERE id=?", sid, now(), i["id"])
@@ -613,6 +646,158 @@ async def tick(bot: Bot):
     await send_reminders(bot)
 
 
+# ─────────── ФОКУСЫ НА ДЕНЬ ───────────
+WD_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+FOCUS_SYSTEM = """Ты помощник владелицы пиццерии Додо ({owner}), она управляет удалённо. Управляющая — {other}.
+Каждый вечер ты готовишь владелице короткий анализ дня и фокусы управляющей на завтра.
+
+Источники: задачи планировщика на сегодня и на завтра (со статусами), вопросы владелицы без ответа, переписка за последние 2 дня.
+
+Ответь ТОЛЬКО JSON без пояснений и без ```:
+{{"analysis":["...","..."],"focuses":["...","..."]}}
+
+analysis — 3–6 коротких пунктов: что сделано сегодня, что зависло или просрочено, где повторяются переносы, на что владелице обратить внимание.
+focuses — 3–5 самых важных конкретных действий для управляющей на завтра, по одному на строку, до 15 слов, в повелительной форме, с ответственным/сроком если известны. Приоритет: срок завтра или уже просрочено; вопросы владелицы без ответа; задачи, которые переносили не раз; то, что влияет на деньги, людей и проверки. Обычные ежедневные пункты чек-листа не включай, если по ним нет проблем."""
+
+
+def _fmt_tasks(day):
+    if not day or not day.get("tasks"):
+        return "нет данных"
+    out = []
+    for t in day["tasks"]:
+        extra = f" [{t.get('info')}]" if t.get("info") else ""
+        kind = " (чек-лист)" if t.get("kind") == "base" else ""
+        out.append(f"- {t.get('status')}: {t.get('text')}{kind}{extra}")
+    return "\n".join(out[:120])
+
+
+def focus_markup(key, chat_id):
+    tag = f"{chat_id}:{key}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить утром", callback_data=f"fok:{tag}"),
+         InlineKeyboardButton(text="✏️ Изменить", callback_data=f"fed:{tag}")],
+        [InlineKeyboardButton(text="❌ Не отправлять", callback_data=f"fno:{tag}")]])
+
+
+def focus_text_owner(draft):
+    lines = [f"🌙 Анализ дня ({draft['title']}):"] + [f"• {a}" for a in draft.get("analysis", [])]
+    lines += ["", f"🎯 Фокусы на завтра, {draft['label']}:"]
+    lines += [f"{n}. {f}" for n, f in enumerate(draft["focuses"], 1)]
+    status = {"draft": "Утвердите — отправлю утром в {h}:00 МСК.", "approved": "✅ Утверждено — отправлю в {h}:00 МСК.",
+              "cancelled": "❌ Не отправляю.", "sent": "📨 Отправлено."}[draft["status"]]
+    lines += ["", status.format(h=FOCUS_SEND_HOUR, o=draft["title"])]
+    return "\n".join(lines)
+
+
+def focus_text_staff(draft):
+    lines = [f"🎯 Фокусы на сегодня, {draft['label']}:"]
+    lines += [f"{n}. {f}" for n, f in enumerate(draft["focuses"], 1)]
+    if draft.get("sheet"):
+        lines += ["", f"Остальные задачи — в таблице на листе «{draft['sheet'].replace('🧭 ', '')}»."]
+    return "\n".join(lines)
+
+
+async def prepare_focus(bot: Bot, chat, key: str, today: str):
+    cid = chat["chat_id"]
+    owner, other = owner_name_for(chat), chat["title"]
+    d = datetime.strptime(key, "%Y-%m-%d")
+    label = f"{WD_SHORT[d.weekday()]} {d.strftime('%d.%m')}"
+    plan = await sheet_json({"action": "list", "dates": [today, key]}) or {}
+    days = plan.get("days", {})
+    items = q("SELECT * FROM items WHERE chat_id=? AND status IN ('open','moved','review') ORDER BY asked_ts", cid)
+    q_txt = "\n".join(f"- {i['question']} (спросили {fmt_ts(i['asked_ts'])}, напоминаний {i['reminders']}"
+                      f"{', перенесено в таблицу' if i['status'] == 'moved' else ''})" for i in items) or "нет"
+    msgs = q("""SELECT * FROM (SELECT * FROM msgs WHERE chat_id=? AND deleted=0 AND who!='bot' AND ts>=?
+                ORDER BY ts DESC LIMIT 300) ORDER BY ts""", cid, now() - 2 * 86400)
+    chat_txt = "\n".join(f"[{fmt_ts(m['ts'])}] {owner if m['who'] == 'owner' else other}: {m['text']}" for m in msgs) or "нет"
+    user = (f"Сегодня {today}, завтра {key} ({label}).\n\n"
+            f"Планировщик на СЕГОДНЯ ({(days.get(today) or {}).get('sheet', '')}):\n{_fmt_tasks(days.get(today))}\n\n"
+            f"Планировщик на ЗАВТРА ({(days.get(key) or {}).get('sheet', '')}):\n{_fmt_tasks(days.get(key))}\n\n"
+            f"Вопросы владелицы без ответа:\n{q_txt}\n\nПереписка за 2 дня:\n{chat_txt}")
+    raw = await ask_claude(system=FOCUS_SYSTEM.format(owner=owner, other=other),
+                           messages=[{"role": "user", "content": user}])
+    data = parse_json(raw)
+    focuses = [str(f).strip() for f in data.get("focuses", []) if str(f).strip()][:5]
+    if not focuses:
+        raise RuntimeError("Claude не предложил фокусы: " + raw[:200])
+    draft = {"chat_id": cid, "key": key, "label": label, "title": other, "status": "draft",
+             "analysis": [str(a) for a in data.get("analysis", [])][:6], "focuses": focuses,
+             "sheet": (days.get(key) or {}).get("sheet", "")}
+    kv_set(f"focus:{cid}:{key}", draft)
+    await notify_owner(bot, chat, focus_text_owner(draft), focus_markup(key, cid))
+
+
+async def send_focus(bot: Bot, chat, draft) -> bool:
+    text = focus_text_staff(draft)
+    cid = chat["chat_id"]
+    try:
+        sent = await bot.send_message(cid, text, business_connection_id=chat["conn_id"])
+        store_msg(cid, sent.message_id, "bot", "bot", text, now())
+        return True
+    except Exception as e:
+        log.warning("Фокусы через ваш аккаунт не отправлены: %s", e)
+    try:
+        await bot.send_message(cid, f"{text}\n\n(от {owner_name_for(chat)})")
+        return True
+    except Exception as e:
+        log.warning("Фокусы через чат бота не отправлены: %s", e)
+    await notify_owner(bot, chat, "Не получилось отправить фокусы — Telegram не даёт боту написать первым "
+                                  "(в чате не было переписки больше суток). Перешлите сами:\n\n" + text)
+    return False
+
+
+def next_work_day(dt):
+    from datetime import timedelta
+    n = dt + timedelta(days=1)
+    return n if (n.weekday() not in DAYS_OFF and n.weekday() in WEEKDAY_SHEETS) else None
+
+
+async def focus_tick(bot: Bot):
+    if not FOCUS_ENABLED or is_paused():
+        return
+    nowm = datetime.now(TZ)
+    today = nowm.strftime("%Y-%m-%d")
+    for chat in q("SELECT * FROM chats WHERE conn_id IS NOT NULL"):
+        cid = chat["chat_id"]
+        # вечер: подготовить фокусы на завтра
+        tomorrow = next_work_day(nowm)
+        if nowm.hour >= FOCUS_PREP_HOUR and tomorrow is not None:
+            key = tomorrow.strftime("%Y-%m-%d")
+            if not kv_get(f"focus:{cid}:{key}") and not kv_get(f"focus_try:{cid}:{key}"):
+                kv_set(f"focus_try:{cid}:{key}", 1)
+                try:
+                    await prepare_focus(bot, chat, key, today)
+                except Exception as e:
+                    log.exception("Фокусы не подготовлены: %s", e)
+                    await notify_owner(bot, chat, f"Не получилось подготовить фокусы на завтра: {e}")
+        # утро: отправить утверждённые
+        if nowm.hour >= FOCUS_SEND_HOUR and nowm.weekday() not in DAYS_OFF:
+            draft = kv_get(f"focus:{cid}:{today}")
+            if draft and draft.get("status") == "approved":
+                if await send_focus(bot, chat, draft):
+                    draft["status"] = "sent"
+                    kv_set(f"focus:{cid}:{today}", draft)
+                    await notify_owner(bot, chat, f"📨 Фокусы отправлены {chat['title']}.")
+                else:
+                    draft["status"] = "cancelled"
+                    kv_set(f"focus:{cid}:{today}", draft)
+            elif draft and draft.get("status") == "draft" and not draft.get("nagged"):
+                draft["nagged"] = 1
+                kv_set(f"focus:{cid}:{today}", draft)
+                await notify_owner(bot, chat, "Фокусы на сегодня не утверждены — отправить сейчас?",
+                                   focus_markup(today, cid))
+
+
+async def focus_scheduler(bot: Bot):
+    while True:
+        try:
+            await focus_tick(bot)
+        except Exception as e:
+            log.exception("Ошибка фокусов: %s", e)
+        await asyncio.sleep(60)
+
+
 async def scheduler(bot: Bot):
     while True:
         try:
@@ -659,7 +844,8 @@ async def cmd_help(m: Message):
         "Я слежу за вашим чатом и напоминаю, если на ваш вопрос долго нет ответа.\n\n"
         "/status — открытые вопросы\n/check — проверить переписку сейчас\n"
         "/remind — отправить напоминания сейчас\n/done 5 — закрыть вопрос №5 (/done all — все)\n"
-        "/pause, /resume — выключить / включить напоминания\n\n"
+        "/pause, /resume — выключить / включить напоминания\n"
+        "/focus — подготовить фокусы на завтра прямо сейчас\n\n"
         "Чтобы я изучил старую переписку — пришлите файл result.json (экспорт чата из Telegram Desktop).")
 
 
@@ -743,6 +929,54 @@ async def on_button(cb: CallbackQuery, bot: Bot):
     await cb.answer()
 
 
+@router.callback_query(F.data.regexp(r"^(fok|fed|fno):-?\d+:\d{4}-\d{2}-\d{2}$"))
+async def on_focus_button(cb: CallbackQuery, bot: Bot):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer()
+    action, cid, key = cb.data.split(":", 2)
+    k = f"focus:{cid}:{key}"
+    draft = kv_get(k)
+    if not draft or draft.get("status") == "sent":
+        await cb.answer("Уже неактуально")
+        return await cb.message.edit_reply_markup(reply_markup=None)
+    if action == "fed":
+        kv_set("focus_edit", k)
+        await cb.answer()
+        return await cb.message.answer("Пришлите фокусы одним сообщением — каждый с новой строки. Я заменю список.")
+    draft["status"] = "approved" if action == "fok" else "cancelled"
+    kv_set(k, draft)
+    chat = q1("SELECT * FROM chats WHERE chat_id=?", int(cid))
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    # если утро уже наступило — отправляем сразу
+    if action == "fok" and key == today and datetime.now(TZ).hour >= FOCUS_SEND_HOUR and chat:
+        if await send_focus(bot, chat, draft):
+            draft["status"] = "sent"
+            kv_set(k, draft)
+    await cb.message.edit_text(focus_text_owner(draft))
+    await cb.answer()
+
+
+@router.message(owner_only, Command("focus"))
+async def cmd_focus(m: Message, bot: Bot):
+    """Подготовить фокусы на ближайший рабочий день прямо сейчас."""
+    if not is_owner(m.from_user.id):
+        return
+    nowm = datetime.now(TZ)
+    nxt = next_work_day(nowm)
+    from datetime import timedelta
+    probe = nowm
+    while nxt is None:
+        probe += timedelta(days=1)
+        nxt = next_work_day(probe)
+    key = nxt.strftime("%Y-%m-%d")
+    await m.answer("Готовлю анализ и фокусы…")
+    for chat in q("SELECT * FROM chats WHERE conn_id IS NOT NULL"):
+        try:
+            await prepare_focus(bot, chat, key, nowm.strftime("%Y-%m-%d"))
+        except Exception as e:
+            await m.answer(f"Ошибка: {e}")
+
+
 # ─────────── ИМПОРТ СТАРОЙ ПЕРЕПИСКИ (result.json из Telegram Desktop) ───────────
 def export_text(t) -> str:
     if isinstance(t, str):
@@ -814,12 +1048,32 @@ async def on_document(m: Message, bot: Bot):
                    f"Первые напоминания по этим вопросам уйдут не раньше чем через {REMIND_EVERY_H:g} ч.")
 
 
+@router.message(owner_only, F.text)
+async def on_owner_text(m: Message):
+    if not is_owner(m.from_user.id) or m.text.startswith("/"):
+        return
+    k = kv_get("focus_edit")
+    if not k:
+        return await m.answer("Команды: /help")
+    draft = kv_get(k)
+    ex("DELETE FROM kv WHERE k='focus_edit'")
+    if not draft:
+        return await m.answer("Черновик не найден.")
+    items = [re.sub(r"^\s*(\d+[.)]|[-•*])\s*", "", ln).strip() for ln in m.text.splitlines()]
+    draft["focuses"] = [i for i in items if i][:10]
+    draft["status"] = "draft"
+    kv_set(k, draft)
+    _, cid, key = k.split(":", 2)
+    await m.answer(focus_text_owner(draft), reply_markup=focus_markup(key, int(cid)))
+
+
 # ─────────── ЗАПУСК ───────────
 async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     asyncio.create_task(scheduler(bot))
+    asyncio.create_task(focus_scheduler(bot))
     log.info("Бот запущен. Модель: %s", MODEL)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
