@@ -32,6 +32,7 @@ import base64
 import sqlite3
 import tempfile
 import time
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import (BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyParameters)
 from anthropic import AsyncAnthropic
+import aiohttp
 
 load_dotenv()
 
@@ -58,6 +60,11 @@ MAX_REMINDERS = int(os.getenv("MAX_REMINDERS", "3"))      # после стол�
 # выходные дни, когда напоминания не отправляются (по московскому времени)
 _DAYS = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
 DAYS_OFF = {_DAYS[d] for d in re.findall(r"[а-я]{2}", os.getenv("DAYS_OFF", "ср,вс").lower()) if d in _DAYS}
+# перенос в Google Таблицу задач: после стольких напоминаний вопрос уходит в таблицу
+SHEET_URL = os.getenv("SHEET_WEBHOOK_URL", "").strip()
+SHEET_SECRET = os.getenv("SHEET_SECRET", "").strip()
+MOVE_AFTER = int(os.getenv("MOVE_AFTER_REMINDERS", "2"))
+WEEKDAY_SHEETS = {0: "🧭 Упр Пн", 1: "🧭 Упр Вт", 3: "🧭 Упр Чт", 4: "🧭 Упр Пт", 5: "🧭 Упр Сб"}
 QUIET_MIN = int(os.getenv("QUIET_AFTER_ACTIVITY_MIN", "30"))  # не влезать, если в чате переписываются прямо сейчас
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))      # сколько дней переписки анализировать
 PREFIX = os.getenv("REMINDER_PREFIX", "🤖 Напоминание")
@@ -94,7 +101,7 @@ CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 """)
 for table, col, decl in [("msgs", "media", "TEXT"), ("msgs", "file_id", "TEXT"),
                          ("msgs", "pending", "INTEGER DEFAULT 0"), ("msgs", "forwarded", "INTEGER DEFAULT 0"),
-                         ("items", "answer_ids", "TEXT")]:
+                         ("items", "answer_ids", "TEXT"), ("items", "sheet_id", "TEXT")]:
     if col not in [r[1] for r in db.execute(f"PRAGMA table_info({table})")]:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 db.commit()
@@ -344,8 +351,8 @@ async def analyze_chat(chat_id: int, delay_first: bool = False, bot: Bot | None 
     if not msgs:
         return 0
     owner, other = owner_name_for(chat), chat["title"]
-    known = q("SELECT * FROM items WHERE chat_id=? AND status='open'", chat_id)
-    done = q("SELECT * FROM items WHERE chat_id=? AND status!='open' AND asked_ts>=?",
+    known = q("SELECT * FROM items WHERE chat_id=? AND status IN ('open','moved')", chat_id)
+    done = q("SELECT * FROM items WHERE chat_id=? AND status NOT IN ('open','moved') AND asked_ts>=?",
              chat_id, now() - LOOKBACK_DAYS * 86400)
     lines = [f"[#{m['msg_id']} {fmt_ts(m['ts'])}] {owner if m['who'] == 'owner' else other}: {m['text']}" for m in msgs]
     known_txt = "\n".join(f"{i['id']}. {i['question']} (сообщение #{i['asked_msg_id']})" for i in known) or "нет"
@@ -375,6 +382,9 @@ async def analyze_chat(chat_id: int, delay_first: bool = False, bot: Bot | None 
         st, iid = e.get("status"), e.get("id")
         if iid not in known_ids or st not in ("resolved", "unclear"):
             continue
+        old = q1("SELECT * FROM items WHERE id=?", iid)
+        if old["status"] == "moved" and st == "resolved" and old["sheet_id"]:
+            await sheet_call({"action": "status", "id": old["sheet_id"], "status": "Выполнено"})
         ex("UPDATE items SET status=?, closed_ts=?, answer_ids=? WHERE id=?",
            "resolved" if st == "resolved" else "review", now(), json.dumps(answers(e)), iid)
         to_report.append(iid)
@@ -480,7 +490,23 @@ async def remind_items(bot: Bot, chat, due) -> bool:
             ex("UPDATE items SET reminders=reminders+1, last_remind=? WHERE id=?", t, i["id"])
         return True
     except Exception as e:
-        log.warning("Напоминание не отправлено: %s", e)
+        log.warning("Напоминание через ваш аккаунт не отправлено: %s", e)
+        # запасной путь: личный чат бота с сотрудником (работает, если он(а) хоть раз нажал(а) «Старт» у бота)
+        owner = owner_name_for(chat)
+        if len(due) == 1:
+            alt = f"🤖 Напоминание ({owner}): жду ответа — {due[0]['question']}"
+        else:
+            alt = f"🤖 Напоминание ({owner}). Жду ответа:\n" + "\n".join(
+                f"{n}. {i['question']}" for n, i in enumerate(due, 1))
+        alt += "\n\nОтветьте, пожалуйста, в нашем обычном чате."
+        try:
+            await bot.send_message(cid, alt)
+            for i in due:
+                ex("UPDATE items SET reminders=reminders+1, last_remind=? WHERE id=?", t, i["id"])
+            log.info("Напоминание отправлено через чат бота")
+            return True
+        except Exception as e2:
+            log.warning("И через чат бота не получилось: %s", e2)
         for i in due:
             ex("UPDATE items SET last_remind=? WHERE id=?", t, i["id"])
         await notify_owner(bot, chat,
@@ -489,6 +515,50 @@ async def remind_items(bot: Bot, chat, due) -> bool:
             f"не даёт боту писать первым. Напишите туда что-нибудь сами — и бот продолжит.\n\n"
             f"Ждут ответа:\n" + "\n".join(f"• {i['question']}" for i in due) + f"\n\n(ошибка: {e})")
         return False
+
+
+# ─────────── ПЕРЕНОС В GOOGLE ТАБЛИЦУ ───────────
+async def sheet_call(payload: dict) -> bool:
+    if not SHEET_URL:
+        return False
+    payload = dict(payload, secret=SHEET_SECRET)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
+            async with s.post(SHEET_URL, json=payload, allow_redirects=True) as r:
+                txt = await r.text()
+        ok = '"ok":true' in txt.replace(" ", "")
+        if not ok:
+            log.warning("Таблица ответила: %s", txt[:300])
+        return ok
+    except Exception as e:
+        log.warning("Ошибка связи с таблицей: %s", e)
+        return False
+
+
+def work_day_sheet():
+    """Сегодняшняя (или ближайшая рабочая) вкладка и дата."""
+    from datetime import timedelta
+    d = datetime.now(TZ)
+    for _ in range(7):
+        if d.weekday() in WEEKDAY_SHEETS and d.weekday() not in DAYS_OFF:
+            return WEEKDAY_SHEETS[d.weekday()], d.strftime("%Y-%m-%d")
+        d += timedelta(days=1)
+    return "🧭 Упр Пн", datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+async def move_to_sheet(bot: Bot, chat, items) -> None:
+    sheet, date = work_day_sheet()
+    moved = []
+    for i in items:
+        sid = "tg:" + str(uuid.uuid4())
+        text = f"{i['question']} (вопрос из Telegram от {fmt_ts(i['asked_ts'])[:5]}, без ответа)"
+        if await sheet_call({"action": "add", "id": sid, "date": date, "text": text, "sheet": sheet}):
+            ex("UPDATE items SET status='moved', sheet_id=?, closed_ts=? WHERE id=?", sid, now(), i["id"])
+            moved.append(i)
+    if moved:
+        await notify_owner(bot, chat,
+            f"📋 Перенесено в таблицу задач (вкладка «{sheet}») — {chat['title']} не ответила "
+            f"после {MOVE_AFTER} напоминаний:\n" + "\n".join(f"• {i['question']}" for i in moved))
 
 
 async def send_reminders(bot: Bot, force: bool = False):
@@ -504,6 +574,11 @@ async def send_reminders(bot: Bot, force: bool = False):
             due = q("""SELECT * FROM items WHERE chat_id=? AND status='open' AND reminders<?
                        AND ?-asked_ts>=? AND ?-last_remind>=? ORDER BY asked_ts""",
                     cid, MAX_REMINDERS, t, FIRST_REMIND_AFTER_H * 3600, t, REMIND_EVERY_H * 3600)
+        if due and SHEET_URL and not force:
+            to_move = [i for i in due if i["reminders"] >= MOVE_AFTER]
+            due = [i for i in due if i["reminders"] < MOVE_AFTER]
+            if to_move:
+                await move_to_sheet(bot, chat, to_move)
         if due:
             await remind_items(bot, chat, due)
 
@@ -562,6 +637,9 @@ def status_text() -> str:
     if rev:
         head += "Ждут вашего решения (ответ голосом/фото):\n" + "\n".join(
             f"{r['id']}. {r['question']}" for r in rev) + "\n\n"
+    mv = q("""SELECT i.* FROM items i WHERE i.status='moved' ORDER BY i.asked_ts""")
+    if mv:
+        head += "📋 Перенесены в таблицу задач:\n" + "\n".join(f"{r['id']}. {r['question']}" for r in mv) + "\n\n"
     if not rows:
         return head + "Открытых вопросов нет 👍"
     out = [head + "Ждут ответа:"]
@@ -575,7 +653,8 @@ def status_text() -> str:
 @router.message(owner_only, Command("start", "help"))
 async def cmd_help(m: Message):
     if not is_owner(m.from_user.id):
-        return await m.answer("Это служебный бот.")
+        return await m.answer("Готово ✅ Сюда будут приходить напоминания о рабочих вопросах, "
+                              "если не получится написать в обычный чат. Отвечать нужно в обычном чате.")
     await m.answer(
         "Я слежу за вашим чатом и напоминаю, если на ваш вопрос долго нет ответа.\n\n"
         "/status — открытые вопросы\n/check — проверить переписку сейчас\n"
