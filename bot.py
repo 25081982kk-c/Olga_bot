@@ -153,7 +153,7 @@ for table, col, decl in [("msgs", "media", "TEXT"), ("msgs", "file_id", "TEXT"),
                          ("tasks2", "src_msg", "INTEGER"), ("tasks2", "comment", "TEXT"),
                          ("tasks2", "about", "TEXT"), ("tasks2", "snooze", "INTEGER DEFAULT 0"),
                          ("tasks2", "link_id", "TEXT"), ("tasks2", "link_text", "TEXT"),
-                         ("tasks2", "day", "TEXT")]:
+                         ("tasks2", "day", "TEXT"), ("rem", "cal_id", "TEXT"), ("rem", "timed", "INTEGER DEFAULT 1")]:
     if col not in [r[1] for r in db.execute(f"PRAGMA table_info({table})")]:
         db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 db.commit()
@@ -1078,6 +1078,65 @@ async def on_news_rm(cb: CallbackQuery):
     await cb.answer()
 
 
+# ─────────── ДУБЛИ: приоритет у поручения, из новостей повтор убираем ───────────
+OPEN_ST = ("queued", "approved", "sent", "draft")
+
+
+def same_task(a: str, b: str) -> bool:
+    stop = {"чтобы", "котор", "сегод", "завтр", "надо", "нужно", "пожал"}
+    wa = {w[:5] for w in _words(a)} - stop   # основа слова: «розыгрыша» = «розыгрыш»
+    wb = {w[:5] for w in _words(b)} - stop
+    return bool(wa and wb) and len(wa & wb) >= max(2, round(0.6 * min(len(wa), len(wb))))
+
+
+def open_task_like(text: str, exclude: int = 0):
+    for t in q(f"SELECT * FROM tasks2 WHERE kind IN ('task','question') AND status IN ({','.join('?' * len(OPEN_ST))}) AND id!=?",
+               *OPEN_ST, exclude):
+        if same_task(text, t["text"]):
+            return t
+    return None
+
+
+def news_strip_dups(nid: int) -> list:
+    """Из задач новости убрать то, что уже есть поручением, и повторы внутри самой новости."""
+    n = q1("SELECT * FROM news WHERE id=?", nid)
+    if not n:
+        return []
+    keep, gone = [], []
+    for x in json.loads(n["tasks"] or "[]"):
+        tx = str(x.get("text", ""))
+        if open_task_like(tx) or any(same_task(tx, k.get("text", "")) for k in keep):
+            gone.append(tx)
+        else:
+            keep.append(x)
+    if gone:
+        ex("UPDATE news SET tasks=? WHERE id=?", json.dumps(keep, ensure_ascii=False), nid)
+    return gone
+
+
+def dedupe_all() -> list:
+    """Разовая/ежедневная чистка: повторы поручений, задачи новостей = поручения, повторы новостей."""
+    notes = []
+    seen = []
+    for t in q(f"SELECT * FROM tasks2 WHERE kind IN ('task','question') AND status IN ({','.join('?' * len(OPEN_ST))}) ORDER BY id",
+               *OPEN_ST):
+        if any(same_task(t["text"], s_["text"]) for s_ in seen):
+            ex("UPDATE tasks2 SET status='cancelled' WHERE id=?", t["id"])
+            notes.append(f"📋 повтор поручения убран: {t['text'][:70]}")
+        else:
+            seen.append(t)
+    titles = []
+    for n in q("SELECT * FROM news WHERE status IN ('draft','approved') ORDER BY id"):
+        if any(same_task(n["title"], x) for x in titles):
+            ex("UPDATE news SET status='deleted' WHERE id=?", n["id"])
+            notes.append(f"📰 повтор новости убран: {n['title'][:70]}")
+            continue
+        titles.append(n["title"])
+        for g in news_strip_dups(n["id"]):
+            notes.append(f"📰→📋 задача из новости уже есть поручением: {g[:70]}")
+    return notes
+
+
 def news_text(n) -> str:
     tasks = json.loads(n["tasks"] or "[]")
     t = f"📰 {n['title']}\n{n['summary']}"
@@ -1125,10 +1184,13 @@ async def news_ingest(bot: Bot, m: Message, from_owner: bool = False):
                          (str(data.get("title", ""))[:80], str(data.get("summary", "")),
                           json.dumps(fix_news_dues(data.get("tasks", [])[:6]), ensure_ascii=False), text[:3000], now()))
         db.commit()
+        gone = news_strip_dups(cur.lastrowid)
         n = q1("SELECT * FROM news WHERE id=?", cur.lastrowid)
         chat = main_chat()
         if chat:
-            await notify_owner(bot, chat, "📰 Новость сети для Ольги:\n\n" + news_text(n), news_markup(n["id"]))
+            await notify_owner(bot, chat, "📰 Новость сети для Ольги:\n\n" + news_text(n)
+                               + ("\n\n🔁 Убрала задачи, которые уже есть поручениями: " + "; ".join(g[:50] for g in gone)
+                                  if gone else ""), news_markup(n["id"]))
     except Exception as e:
         log.warning("Новость: %s", e)
 
@@ -1201,6 +1263,7 @@ async def send_news(bot: Bot, chat, today: str) -> int:
                                          reply_markup=news_accept_markup(n["id"]), business_connection_id=chat["conn_id"])
             store_msg(cid, msg.message_id, "bot", "bot", f"📰 {n['title']}\n{n['summary']}", now())
             tids = []
+            tasks = [x for x in tasks if not open_task_like(str(x.get("text", "")))]
             for i, x in enumerate(tasks, 1):
                 due = x.get("due") or ""
                 if len(due) >= 10:  # срок на выходной управляющей → ближайший рабочий день
@@ -1312,9 +1375,11 @@ async def cmd_news(m: Message):
 
 @router.message(owner_only, F.forward_origin)
 async def on_owner_forward(m: Message, bot: Bot):
-    """Пересланное владелицей сообщение = новость на разбор."""
+    """Пересланное владелицей сообщение = новость на разбор; пересланный файл (PDF и т.п.) — вложение к поручению."""
     if not is_owner(m.from_user.id):
         return
+    if m.document and not (m.document.file_name or "").lower().endswith(".json"):
+        return await owner_file(m)
     await m.answer("📰 Разбираю новость…")
     await news_ingest(bot, m, from_owner=True)
 
@@ -1752,6 +1817,10 @@ async def save_inbox_items(m, chat, items, photo=None, replace_id=None):
             photo_used = photo_used or bool(photo)
             clar.append(q1("SELECT * FROM tasks2 WHERE id=?", cur.lastrowid))
             continue
+        dup = open_task_like(str(it.get("text", "")))
+        if dup:
+            await m.answer(f"🔁 Такое поручение уже есть — не дублирую:\n«{dup['text']}» ({day_label(dup['day'] or '') if dup['day'] else 'в работе'})")
+            continue
         day = urgent_day() if mode == "urgent" else resolve_day(str(it.get("day") or ""))
         due = it.get("due") or ""
         if not due.startswith(day):
@@ -1772,6 +1841,10 @@ async def save_inbox_items(m, chat, items, photo=None, replace_id=None):
         await m.answer(("📌 " if t["kind"] == "task" else "") + task_line(t) + (" 📷" if t["photo"] else "")
                        + f"\n💡 Рекомендую: {day_label(day).split(' (')[0]}" + (f" — {reason}" if reason else "")
                        + "\nИли выберите вручную:", reply_markup=day_markup(t["id"], day))
+    if new_tasks:   # приоритет у поручения: из новостей такие задачи убираем
+        for n in q("SELECT id FROM news WHERE status IN ('draft','approved')"):
+            for g in news_strip_dups(n["id"]):
+                await m.answer(f"🔁 Из новости убрала задачу — она теперь поручение: {g[:80]}")
     if new_tasks:
         asyncio.create_task(link_twins(m, new_tasks))
     if clar:
@@ -3073,6 +3146,11 @@ async def focus_scheduler(bot: Bot):
             await sync_tick(bot)
             await morning_moves(bot)
             await rem_tick(bot)
+            if kv_get("dedupe_day") != datetime.now(TZ).strftime("%Y-%m-%d"):
+                kv_set("dedupe_day", datetime.now(TZ).strftime("%Y-%m-%d"))
+                dn = dedupe_all()
+                if dn:
+                    day_note("🔁 Убраны дубли:\n" + "\n".join(dn[:20]))
             await ctl_tick(bot)
             await mgr_tick(bot)
             await cash_owner_tick(bot)
@@ -3787,7 +3865,9 @@ REM_SYSTEM = """Владелица просит напомнить ЕЙ САМО
   Время не указано — 09:00. День не указан: если время ещё не прошло — сегодня, иначе завтра.
   «через 2 часа», «через 30 минут» — считай от текущего времени.
 - repeat — "none" | "daily" | "weekdays" (Пн–Пт) | "weekly" (каждую неделю в этот день) | "monthly" (каждый месяц этого числа).
-Ответь ТОЛЬКО JSON без ```: {{"text":"...","when":"ГГГГ-ММ-ДД ЧЧ:ММ","repeat":"none"}}"""
+- has_date — true, если она назвала день/дату («завтра», «в пятницу», «5-го», «через 2 часа»), иначе false;
+- has_time — true, если назвала время, иначе false.
+Ответь ТОЛЬКО JSON без ```: {{"text":"...","when":"ГГГГ-ММ-ДД ЧЧ:ММ","repeat":"none","has_date":true,"has_time":true}}"""
 
 
 def rem_fmt(ts: int) -> str:
@@ -3819,7 +3899,7 @@ def rem_next(ts: int, repeat: str, mday: int = 0) -> int:
             return int(d.timestamp())
 
 
-async def rem_create(m: Message, text: str, edit_id: int | None = None):
+async def rem_create(m: Message, text: str, edit_id: int | None = None, task: bool = False):
     raw = await ask_claude(max_tokens=400, system=REM_SYSTEM.format(
         now=datetime.now(OWNER_TZ).strftime("%A %d.%m.%Y %H:%M")), messages=[{"role": "user", "content": text}])
     d = parse_json(raw)
@@ -3828,6 +3908,11 @@ async def rem_create(m: Message, text: str, edit_id: int | None = None):
         what = str(d["text"]).strip()[:200]
     except Exception:
         return await m.answer("Не понял, когда напомнить. Напишите, например: «Напомни завтра в 10 оплатить аренду».")
+    timed = 1 if d.get("has_time", True) else 0
+    if task and not edit_id and not d.get("has_date"):   # дату не назвала — даём выбрать кнопками
+        kv_set("rem_pending", {"text": what, "hm": when.strftime("%H:%M") if timed else "", "ts": now()})
+        return await m.answer(f"📅 Когда? «{what}»" + (f" (в {when.strftime('%H:%M')})" if timed else ""),
+                              reply_markup=rem_days_kb("rd:new"))
     rpt = d.get("repeat") if d.get("repeat") in REM_REPEAT else "none"
     ts = int(when.timestamp())
     mday = when.day if rpt == "monthly" else 0
@@ -3836,18 +3921,64 @@ async def rem_create(m: Message, text: str, edit_id: int | None = None):
     if ts <= now():
         ts = now() + 60
     if edit_id:
-        ex("UPDATE rem SET text=?, next_ts=?, repeat=?, mday=?, status='active', nags=0 WHERE id=?",
-           what, ts, rpt, mday, edit_id)
+        ex("UPDATE rem SET text=?, next_ts=?, repeat=?, mday=?, timed=?, status='active', nags=0 WHERE id=?",
+           what, ts, rpt, mday, timed, edit_id)
         rid = edit_id
     else:
-        cur = db.execute("INSERT INTO rem(text,next_ts,repeat,mday,created) VALUES(?,?,?,?,?)",
-                         (what, ts, rpt, mday, now()))
+        cur = db.execute("INSERT INTO rem(text,next_ts,repeat,mday,timed,created) VALUES(?,?,?,?,?,?)",
+                         (what, ts, rpt, mday, timed, now()))
         db.commit()
         rid = cur.lastrowid
-    await m.answer(f"⏰ Напомню: {rem_fmt(ts)} (Панама)" + (f", {REM_REPEAT[rpt]}" if rpt != "none" else "")
-                   + f"\n{what}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                       InlineKeyboardButton(text="✏️ Изменить", callback_data=f"rm:ed:{rid}"),
-                       InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rm:del:{rid}")]]))
+    cal = await rem_cal_sync(rid)
+    await m.answer(rem_card(rid) + cal, reply_markup=rem_item_kb(rid))
+
+
+def rem_card(rid: int) -> str:
+    r = q1("SELECT * FROM rem WHERE id=?", rid)
+    when = rem_fmt(r["next_ts"]) if r["timed"] else rem_fmt(r["next_ts"]).split(",")[0] + " (весь день)"
+    return (f"⏰ {when} (Панама)" + (f", {REM_REPEAT[r['repeat']]}" if r["repeat"] != "none" else "") + f"\n{r['text']}")
+
+
+def rem_item_kb(rid: int):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✏️ Изменить", callback_data=f"rm:ed:{rid}"),
+        InlineKeyboardButton(text="📅 Другая дата", callback_data=f"rm:dt:{rid}"),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rm:del:{rid}")]])
+
+
+def rem_days_kb(prefix: str):
+    from datetime import timedelta
+    t = datetime.now(OWNER_TZ)
+    btn = [InlineKeyboardButton(text="Сегодня", callback_data=f"{prefix}:0"),
+           InlineKeyboardButton(text="Завтра", callback_data=f"{prefix}:1")]
+    more = [InlineKeyboardButton(text=f"{WD_SHORT[(t + timedelta(days=i)).weekday()]} {(t + timedelta(days=i)).strftime('%d.%m')}",
+                                 callback_data=f"{prefix}:{i}") for i in range(2, 8)]
+    return InlineKeyboardMarkup(inline_keyboard=[btn, more[:3], more[3:]])
+
+
+async def rem_cal_sync(rid: int) -> str:
+    """Событие в Google Календаре «🍕 Пиццерия»: создать / обновить / удалить по состоянию напоминания."""
+    if not SHEET_URL:
+        return ""
+    r = q1("SELECT * FROM rem WHERE id=?", rid)
+    if not r:
+        return ""
+    if r["status"] == "deleted":
+        if r["cal_id"]:
+            await sheet_json({"action": "cal", "op": "delete", "event_id": r["cal_id"]})
+        return ""
+    title = ("✅ " if r["status"] == "done" else "") + "🍕 " + r["text"]
+    start = r["next_ts"]
+    if not r["timed"]:   # весь день: полдень по Панаме, чтобы дата не съехала
+        d = datetime.fromtimestamp(start, OWNER_TZ)
+        start = int(d.replace(hour=12, minute=0).timestamp())
+    res = await sheet_json({"action": "cal", "op": "update" if r["cal_id"] else "add", "event_id": r["cal_id"] or "",
+                            "title": title, "start": start * 1000, "all_day": not r["timed"]})
+    if res and res.get("event_id"):
+        if res["event_id"] != r["cal_id"]:
+            ex("UPDATE rem SET cal_id=? WHERE id=?", res["event_id"], rid)
+        return "\n📅 В календаре «🍕 Пиццерия»"
+    return "\n⚠️ В календарь не попало (проверьте Bot.gs)"
 
 
 def rem_kb(rid: int):
@@ -3869,6 +4000,13 @@ async def rem_send_owner(bot: Bot, text: str, markup=None):
 
 async def rem_tick(bot: Bot):
     t = now()
+    if SHEET_URL and t - (kv_get("cal_backfill_try") or 0) > 3600 and not kv_get("cal_backfill"):
+        kv_set("cal_backfill_try", t)   # старые напоминания тоже в календарь (пробуем раз в час, пока не получится)
+        ok = True
+        for r in q("SELECT id FROM rem WHERE status IN ('active','sent') AND cal_id IS NULL"):
+            ok = "📅" in (await rem_cal_sync(r["id"])) and ok
+        if ok:
+            kv_set("cal_backfill", t)
     for r in q("SELECT * FROM rem WHERE status='active' AND next_ts<=?", t):
         ex("UPDATE rem SET status='sent', last_sent=?, nags=0 WHERE id=?", t, r["id"])
         await rem_send_owner(bot, f"⏰ {r['text']}", rem_kb(r["id"]))
@@ -3901,19 +4039,60 @@ def rem_list_text() -> str:
 
 def rem_list_kb():
     rows = q("SELECT * FROM rem WHERE status IN ('active','sent') ORDER BY next_ts")
-    if not rows:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"✏️ {i}", callback_data=f"rm:ed:{r['id']}"),
-        InlineKeyboardButton(text=f"🗑 {i}", callback_data=f"rm:del:{r['id']}")] for i, r in enumerate(rows[:40], 1)])
+    kb = [[InlineKeyboardButton(text=f"✏️ {i}", callback_data=f"rm:ed:{r['id']}"),
+           InlineKeyboardButton(text=f"📅 {i}", callback_data=f"rm:dt:{r['id']}"),
+           InlineKeyboardButton(text=f"🗑 {i}", callback_data=f"rm:del:{r['id']}")] for i, r in enumerate(rows[:40], 1)]
+    kb.append([InlineKeyboardButton(text="➕ Задача себе", callback_data="rm:add:0")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-@router.callback_query(F.data.regexp(r"^rm:(ok|h1|tm|ed|del):\d+$"))
+@router.callback_query(F.data.regexp(r"^rd:(new|\d+):\d$"))
+async def on_rem_day(cb: CallbackQuery):
+    """Выбор даты кнопкой: rd:new:N — новая задача из ожидания, rd:<id>:N — перенос существующей."""
+    if not is_owner(cb.from_user.id):
+        return await cb.answer()
+    from datetime import timedelta
+    _, who, off = cb.data.split(":")
+    day = datetime.now(OWNER_TZ) + timedelta(days=int(off))
+    if who == "new":
+        p = kv_get("rem_pending")
+        if not p:
+            return await cb.answer("Задача не найдена — напишите её ещё раз")
+        ex("DELETE FROM kv WHERE k='rem_pending'")
+        hm = p.get("hm") or "09:00"
+        hh, mm = map(int, hm.split(":"))
+        ts = int(day.replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp())
+        cur = db.execute("INSERT INTO rem(text,next_ts,repeat,mday,timed,created) VALUES(?,?,'none',0,?,?)",
+                         (p["text"], max(ts, now() + 60), 1 if p.get("hm") else 0, now()))
+        db.commit()
+        rid = cur.lastrowid
+    else:
+        rid = int(who)
+        r = q1("SELECT * FROM rem WHERE id=?", rid)
+        if not r:
+            return await cb.answer("Не найдено")
+        old = datetime.fromtimestamp(r["next_ts"], OWNER_TZ)
+        ts = int(day.replace(hour=old.hour, minute=old.minute, second=0, microsecond=0).timestamp())
+        ex("UPDATE rem SET next_ts=?, status='active', nags=0 WHERE id=?", max(ts, now() + 60), rid)
+    await cb.answer()
+    cal = await rem_cal_sync(rid)
+    await cb.message.edit_text(rem_card(rid) + cal, reply_markup=rem_item_kb(rid))
+
+
+@router.callback_query(F.data.regexp(r"^rm:(ok|h1|tm|ed|del|dt|add):\d+$"))
 async def on_rem_btn(cb: CallbackQuery):
     if not is_owner(cb.from_user.id):
         return await cb.answer()
     _, act, rid = cb.data.split(":")
+    if act == "add":
+        kv_set("rem_task_wait", now())
+        await cb.answer()
+        return await cb.message.answer("➕ Напишите или наговорите задачу себе. Можно сразу с датой и временем "
+                                       "(«в пятницу в 18:00 закрыть ВДВ») — или без даты, тогда выберете кнопкой.")
     r = q1("SELECT * FROM rem WHERE id=?", int(rid))
+    if act == "dt" and r:
+        await cb.answer()
+        return await cb.message.answer(f"📅 На какой день перенести «{r['text']}»?", reply_markup=rem_days_kb(f"rd:{r['id']}"))
     if not r or r["status"] in ("done", "deleted"):
         return await cb.answer("Уже обработано")
     if act == "ok":
@@ -3931,6 +4110,7 @@ async def on_rem_btn(cb: CallbackQuery):
     elif act == "del":
         ex("UPDATE rem SET status='deleted' WHERE id=?", r["id"])
         await cb.answer("🗑 Удалено")
+        await rem_cal_sync(r["id"])
         return await cb.message.edit_text(rem_list_text(), reply_markup=rem_list_kb())
     else:
         kv_set("rem_edit", {"id": r["id"], "ts": now()})
@@ -3938,6 +4118,7 @@ async def on_rem_btn(cb: CallbackQuery):
         return await cb.message.answer(f"✏️ Напишите или наговорите заново, когда и что напомнить вместо:\n"
                                        f"«{r['text']}» — {rem_fmt(r['next_ts'])}")
     await cb.answer()
+    await rem_cal_sync(r["id"])
     try:
         await cb.message.edit_text(note)
     except Exception:
@@ -6080,7 +6261,7 @@ async def on_file_attach(cb: CallbackQuery):
 async def on_owner_photo(m: Message, bot: Bot):
     if not is_owner(m.from_user.id):
         return
-    if m.forward_origin:
+    if m.forward_origin and len((m.caption or "").strip()) >= 40:   # пост с текстом — новость; просто фото — вложение
         await m.answer("📰 Разбираю новость…")
         return await news_ingest(bot, m, from_owner=True)
     fid = m.photo[-1].file_id
@@ -6122,6 +6303,10 @@ async def on_owner_voice(m: Message, bot: Bot):
     if rme and now() - rme.get("ts", 0) < 1800:
         ex("DELETE FROM kv WHERE k='rem_edit'")
         return await rem_create(m, t, edit_id=int(rme["id"]))
+    rtw = kv_get("rem_task_wait")
+    if rtw and now() - rtw < 1800:
+        ex("DELETE FROM kv WHERE k='rem_task_wait'")
+        return await rem_create(m, t, task=True)
     rvf = kv_get("rv_fix")
     if rvf and now() - rvf.get("ts", 0) < 1800:
         return await review_fix_apply(m, t)
@@ -6164,6 +6349,10 @@ async def on_owner_text(m: Message, bot: Bot):
     if rme and now() - rme.get("ts", 0) < 1800:
         ex("DELETE FROM kv WHERE k='rem_edit'")
         return await rem_create(m, m.text, edit_id=int(rme["id"]))
+    rtw = kv_get("rem_task_wait")
+    if rtw and now() - rtw < 1800:
+        ex("DELETE FROM kv WHERE k='rem_task_wait'")
+        return await rem_create(m, m.text, task=True)
     rvf = kv_get("rv_fix")
     if rvf and now() - rvf.get("ts", 0) < 1800:
         return await review_fix_apply(m, m.text)
